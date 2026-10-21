@@ -70,7 +70,26 @@ class MainController:
             space_object.status
         ))
 
-    def get_space_objects(self):
+    def get_space_objects(self, limit=None, offset=None):
+        if limit is not None and offset is not None:
+            return self.database.fetch_all("""
+                SELECT
+                    id,
+                    catalog_number,
+                    international_id,
+                    object_type,
+                    size,
+                    x,
+                    y,
+                    z,
+                    vx,
+                    vy,
+                    vz,
+                    status
+                FROM space_objects
+                LIMIT ? OFFSET ?
+            """, (limit, offset))
+            
         return self.database.fetch_all("""
             SELECT
                 id,
@@ -221,7 +240,7 @@ class MainController:
         ))
 
     # =================================
-    # РАСЧЁТ СБЛИЖЕНИЙ
+    # РАСЧЁТ СБЛИЖЕНИЙ (Оптимизированный)
     # =================================
 
     def calculate_conjunctions(self):
@@ -255,6 +274,7 @@ class MainController:
             })
 
         results = []
+        conjunctions_data = []
 
         for i in range(len(objects)):
             for j in range(i + 1, len(objects)):
@@ -269,17 +289,7 @@ class MainController:
 
                 conjunction.calculate()
 
-                conjunction_id = self.database.execute("""
-                    INSERT INTO conjunctions (
-                        object1_id,
-                        object2_id,
-                        closest_time,
-                        minimum_distance,
-                        collision_probability,
-                        status
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (
+                conjunctions_data.append((
                     object1["id"],
                     object2["id"],
                     conjunction.closest_time,
@@ -289,7 +299,6 @@ class MainController:
                 ))
 
                 results.append({
-                    "id": conjunction_id,
                     "object1": object1["catalog_number"],
                     "object2": object2["catalog_number"],
                     "time": conjunction.closest_time,
@@ -297,6 +306,26 @@ class MainController:
                     "probability": conjunction.collision_probability,
                     "status": conjunction.status
                 })
+
+        # Пакетная вставка (executemany) с единым коммитом
+        if conjunctions_data:
+            connection = self.database.connect()
+            try:
+                cursor = connection.cursor()
+                cursor.executemany("""
+                    INSERT INTO conjunctions (
+                        object1_id,
+                        object2_id,
+                        closest_time,
+                        minimum_distance,
+                        collision_probability,
+                        status
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, conjunctions_data)
+                connection.commit()
+            finally:
+                connection.close()
 
         return results
 
@@ -355,25 +384,31 @@ class MainController:
         ))
 
     # =================================
-    # ОТЧЁТЫ
+    # ОТЧЁТЫ (Оптимизированные через SQL)
     # =================================
 
     def get_report(self):
+        objects_by_type = self.database.fetch_all("""
+            SELECT object_type, COUNT(*) 
+            FROM space_objects 
+            GROUP BY object_type
+        """)
 
-        report = Report(
-            self.database
-        )
+        total_conjunctions = self.database.fetch_one("""
+            SELECT COUNT(*) FROM conjunctions
+        """)[0]
+
+        dangerous_conjunctions = self.database.fetch_one("""
+            SELECT COUNT(*) FROM conjunctions WHERE status = 'dangerous'
+        """)[0]
+
+        lost_objects = self.database.fetch_all("""
+            SELECT * FROM space_objects WHERE status = 'lost'
+        """)
 
         return {
-            "objects":
-                report.generate_objects_report(),
-
-            "conjunctions":
-                report.generate_conjunction_report(),
-
-            "dangerous":
-                report.generate_dangerous_report(),
-
-            "lost":
-                report.generate_lost_objects_report()
+            "objects": objects_by_type,
+            "conjunctions": total_conjunctions,
+            "dangerous": dangerous_conjunctions,
+            "lost": lost_objects
         }
